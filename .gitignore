@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Local-only project docs (kept out of the public repo)
+DESCRIPTION.md
+
 # User-specific config (may contain keys)
 crosscheck.config.json
 

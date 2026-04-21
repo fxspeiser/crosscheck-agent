@@ -234,6 +234,67 @@ fn active_providers(ctx: &Ctx) -> Vec<Provider> {
     ctx.cfg.providers.iter().filter_map(|n| ctx.providers.get(n).cloned()).collect()
 }
 
+const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "gemini", "mistral", "groq", "deepseek"];
+
+fn resolve_providers(ctx: &Ctx, names: Option<Vec<String>>) -> (Vec<Provider>, Vec<String>) {
+    let Some(names) = names else {
+        return (active_providers(ctx), Vec::new());
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut resolved = Vec::new();
+    let mut unknown = Vec::new();
+    for n in names {
+        let key = n.trim().to_lowercase();
+        if key.is_empty() || !seen.insert(key.clone()) { continue; }
+        match ctx.providers.get(&key) {
+            Some(p) => resolved.push(p.clone()),
+            None    => unknown.push(n),
+        }
+    }
+    (resolved, unknown)
+}
+
+fn extract_provider_names(v: &Value) -> Option<Vec<String>> {
+    v.as_array().map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+}
+
+fn unknown_provider_error(ctx: &Ctx, unknown: &[String]) -> Value {
+    let mut needs_key = Vec::new();
+    let mut typos = Vec::new();
+    for n in unknown {
+        let key = n.trim().to_lowercase();
+        if KNOWN_PROVIDERS.contains(&key.as_str()) { needs_key.push(n.clone()); }
+        else { typos.push(n.clone()); }
+    }
+    let mut available: Vec<String> = ctx.providers.keys().cloned().collect();
+    available.sort();
+    json!({
+        "error": "requested providers are not available",
+        "unknown": unknown,
+        "needs_api_key_in_env": needs_key,
+        "unrecognised_names": typos,
+        "available_now": available,
+    })
+}
+
+async fn tool_list_providers(ctx: Arc<Ctx>, _args: Value) -> Value {
+    let providers: Vec<Value> = KNOWN_PROVIDERS.iter().map(|name| {
+        let key = name.to_string();
+        let prov = ctx.providers.get(&key);
+        json!({
+            "name": name,
+            "available": prov.is_some(),
+            "active": ctx.cfg.providers.contains(&key),
+            "model": prov.map(|p| p.model.clone()),
+        })
+    }).collect();
+    json!({
+        "providers": providers,
+        "moderator_default": ctx.cfg.moderator,
+        "usage_hint": "Pass a 'providers' array to confer/debate/plan/review to pick an ad-hoc subset, e.g. providers=['openai','gemini']. Omit the field to use the configured active set.",
+    })
+}
+
 fn write_transcript(ctx: &Ctx, kind: &str, payload: &Value) -> Option<String> {
     if !ctx.cfg.log_transcripts { return None; }
     let dir = ctx.root.join(".crosscheck").join("transcripts");
@@ -264,10 +325,10 @@ async fn ask_one(ctx: &Ctx, p: &Provider, messages: &[Message], deadline: Instan
 async fn tool_confer(ctx: Arc<Ctx>, args: Value) -> Value {
     let question = args["question"].as_str().unwrap_or("").to_string();
     let context = args["context"].as_str().unwrap_or("").to_string();
-    let names: Vec<String> = args["providers"].as_array().map(|arr|
-        arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
-    ).unwrap_or_else(|| active_providers(&ctx).iter().map(|p| p.name.clone()).collect());
-    let picked: Vec<Provider> = names.iter().filter_map(|n| ctx.providers.get(n).cloned()).collect();
+    let (picked, unknown) = resolve_providers(&ctx, extract_provider_names(&args["providers"]));
+    if !unknown.is_empty() && picked.is_empty() {
+        return unknown_provider_error(&ctx, &unknown);
+    }
     if picked.is_empty() {
         return json!({"error": "no active providers have API keys in .env"});
     }
@@ -287,6 +348,7 @@ async fn tool_confer(ctx: Arc<Ctx>, args: Value) -> Value {
     let answers: Vec<Value> = join_all(futs).await;
 
     let mut out = json!({"tool": "confer", "question": question, "answers": answers});
+    if !unknown.is_empty() { out["skipped_unknown_providers"] = json!(unknown); }
     if let Some(path) = write_transcript(&ctx, "confer", &out) {
         out["transcript"] = json!(path);
     }
@@ -296,12 +358,14 @@ async fn tool_confer(ctx: Arc<Ctx>, args: Value) -> Value {
 async fn tool_debate(ctx: Arc<Ctx>, args: Value) -> Value {
     let topic = args["topic"].as_str().unwrap_or("").to_string();
     let context = args["context"].as_str().unwrap_or("").to_string();
-    let names: Vec<String> = args["providers"].as_array().map(|arr|
-        arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
-    ).unwrap_or_else(|| active_providers(&ctx).iter().map(|p| p.name.clone()).collect());
-    let picked: Vec<Provider> = names.iter().filter_map(|n| ctx.providers.get(n).cloned()).collect();
+    let (picked, unknown) = resolve_providers(&ctx, extract_provider_names(&args["providers"]));
+    if !unknown.is_empty() && picked.len() < 2 {
+        return unknown_provider_error(&ctx, &unknown);
+    }
     if picked.len() < 2 {
-        return json!({"error": "debate needs at least 2 active providers"});
+        let mut available: Vec<String> = ctx.providers.keys().cloned().collect();
+        available.sort();
+        return json!({"error": "debate needs at least 2 providers with keys in .env", "available_now": available});
     }
     let max_rounds = args["max_rounds"].as_u64().unwrap_or(ctx.cfg.max_rounds as u64) as u32;
     let deadline = Instant::now() + Duration::from_secs(ctx.cfg.max_time_seconds);
@@ -361,6 +425,7 @@ async fn tool_debate(ctx: Arc<Ctx>, args: Value) -> Value {
         "transcript": transcript,
         "synthesis": synthesis,
     });
+    if !unknown.is_empty() { out["skipped_unknown_providers"] = json!(unknown); }
     if let Some(path) = write_transcript(&ctx, "debate", &out) {
         out["transcript_path"] = json!(path);
     }
@@ -374,7 +439,10 @@ async fn tool_plan(ctx: Arc<Ctx>, args: Value) -> Value {
         "We need a step-by-step plan to achieve this goal.\n\nGOAL: {}\n\nCONSTRAINTS: {}\n\nReturn: (1) the plan as numbered steps, (2) risks, (3) alternatives considered.",
         goal, if constraints.is_empty() { "(none stated)".into() } else { constraints },
     );
-    tool_debate(ctx, json!({"topic": topic, "context": args["context"].as_str().unwrap_or("")})).await
+    let mut forwarded = json!({"topic": topic, "context": args["context"].as_str().unwrap_or("")});
+    if let Some(p) = args.get("providers") { forwarded["providers"] = p.clone(); }
+    if let Some(m) = args.get("moderator") { forwarded["moderator"] = m.clone(); }
+    tool_debate(ctx, forwarded).await
 }
 
 async fn tool_review(ctx: Arc<Ctx>, args: Value) -> Value {
@@ -384,22 +452,30 @@ async fn tool_review(ctx: Arc<Ctx>, args: Value) -> Value {
         "Review the following code/proposal as peers. Call out bugs, smells, missed edge cases, and suggest concrete changes.\n\nINTENT: {}\n\nSNIPPET:\n```\n{}\n```",
         intent, snippet,
     );
-    tool_confer(ctx, json!({"question": question})).await
+    let mut forwarded = json!({"question": question});
+    if let Some(p) = args.get("providers") { forwarded["providers"] = p.clone(); }
+    tool_confer(ctx, forwarded).await
 }
 
 // ------------------------------------------------------------
 // MCP JSON-RPC loop
 // ------------------------------------------------------------
 fn tool_schemas() -> Value {
+    let prov_desc = "Ad-hoc subset of provider names (e.g. ['openai','gemini','xai']). Omit to use the configured active set. Call list_providers first if you're unsure which names are available.";
     json!([
         {
+            "name": "list_providers",
+            "description": "List every provider the server knows about and whether each is currently usable (has an API key in .env). Call this first to discover who's on the panel.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "confer",
-            "description": "Ask multiple LLMs the same question and return all answers in parallel.",
+            "description": "Ask one or more LLMs the same question and return their answers in parallel.",
             "inputSchema": { "type": "object",
                 "properties": {
                     "question": {"type": "string"},
                     "context": {"type": "string"},
-                    "providers": {"type": "array", "items": {"type": "string"}}
+                    "providers": {"type": "array", "items": {"type": "string"}, "description": prov_desc}
                 },
                 "required": ["question"] }
         },
@@ -410,9 +486,9 @@ fn tool_schemas() -> Value {
                 "properties": {
                     "topic": {"type": "string"},
                     "context": {"type": "string"},
-                    "providers": {"type": "array", "items": {"type": "string"}},
+                    "providers": {"type": "array", "items": {"type": "string"}, "description": format!("{} Needs at least 2.", prov_desc)},
                     "max_rounds": {"type": "integer"},
-                    "moderator": {"type": "string"}
+                    "moderator": {"type": "string", "description": "Provider name to run the synthesis round. Defaults to config.moderator."}
                 },
                 "required": ["topic"] }
         },
@@ -420,14 +496,24 @@ fn tool_schemas() -> Value {
             "name": "plan",
             "description": "Collaborative planning across LLMs with risks + alternatives.",
             "inputSchema": { "type": "object",
-                "properties": { "goal": {"type": "string"}, "constraints": {"type": "string"}, "context": {"type": "string"} },
+                "properties": {
+                    "goal": {"type": "string"},
+                    "constraints": {"type": "string"},
+                    "context": {"type": "string"},
+                    "providers": {"type": "array", "items": {"type": "string"}, "description": format!("{} Needs at least 2.", prov_desc)},
+                    "moderator": {"type": "string"}
+                },
                 "required": ["goal"] }
         },
         {
             "name": "review",
-            "description": "Peer-review a code snippet or proposal across LLMs.",
+            "description": "Peer-review a code snippet or proposal across one or more LLMs.",
             "inputSchema": { "type": "object",
-                "properties": { "snippet": {"type": "string"}, "intent": {"type": "string"} },
+                "properties": {
+                    "snippet": {"type": "string"},
+                    "intent": {"type": "string"},
+                    "providers": {"type": "array", "items": {"type": "string"}, "description": prov_desc}
+                },
                 "required": ["snippet"] }
         }
     ])
@@ -454,6 +540,7 @@ async fn handle(ctx: Arc<Ctx>, req: Value) -> Option<Value> {
             let name = req["params"]["name"].as_str().unwrap_or("").to_string();
             let args = req["params"]["arguments"].clone();
             let out = match name.as_str() {
+                "list_providers" => tool_list_providers(ctx, args).await,
                 "confer" => tool_confer(ctx, args).await,
                 "debate" => tool_debate(ctx, args).await,
                 "plan"   => tool_plan(ctx, args).await,

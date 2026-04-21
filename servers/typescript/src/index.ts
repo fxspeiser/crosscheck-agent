@@ -186,14 +186,66 @@ async function askOne(p: Provider, messages: Msg[], deadline: number): Promise<R
   }
 }
 
+const KNOWN_PROVIDERS = ["anthropic", "openai", "xai", "gemini", "mistral", "groq", "deepseek"];
+
+function resolveProviders(names: string[] | undefined | null): { resolved: Provider[]; unknown: string[] } {
+  if (!names || names.length === 0) return { resolved: activeProviders(), unknown: [] };
+  const seen = new Set<string>();
+  const resolved: Provider[] = [];
+  const unknown: string[] = [];
+  for (const n of names) {
+    const key = n.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const prov = ALL_PROVIDERS[key];
+    if (prov) resolved.push(prov);
+    else unknown.push(n);
+  }
+  return { resolved, unknown };
+}
+
+function unknownProviderError(unknown: string[]) {
+  const needsKey: string[] = [];
+  const typos: string[] = [];
+  for (const n of unknown) {
+    (KNOWN_PROVIDERS.includes(n.trim().toLowerCase()) ? needsKey : typos).push(n);
+  }
+  return {
+    error: "requested providers are not available",
+    unknown,
+    needs_api_key_in_env: needsKey,
+    unrecognised_names: typos,
+    available_now: Object.keys(ALL_PROVIDERS).sort(),
+  };
+}
+
 // ------------------------------------------------------------
 // Tools
 // ------------------------------------------------------------
+async function toolListProviders(_args: any): Promise<any> {
+  const active = new Set(CFG.providers ?? []);
+  return {
+    providers: KNOWN_PROVIDERS.map((name) => {
+      const prov = ALL_PROVIDERS[name];
+      return {
+        name,
+        available: Boolean(prov),
+        active: active.has(name),
+        model: prov?.model ?? null,
+      };
+    }),
+    moderator_default: CFG.moderator,
+    usage_hint:
+      "Pass a 'providers' array to confer/debate/plan/review to pick an ad-hoc subset, " +
+      "e.g. providers=['openai','gemini']. Omit the field to use the configured active set.",
+  };
+}
+
 async function toolConfer(args: any): Promise<any> {
   const question: string = args.question;
   const context: string = args.context ?? "";
-  const names: string[] = args.providers ?? activeProviders().map((p) => p.name);
-  const picked = names.map((n) => ALL_PROVIDERS[n]).filter(Boolean);
+  const { resolved: picked, unknown } = resolveProviders(args.providers);
+  if (unknown.length > 0 && picked.length === 0) return unknownProviderError(unknown);
   if (picked.length === 0) return { error: "no active providers have API keys in .env" };
 
   const messages: Msg[] = [
@@ -205,6 +257,7 @@ async function toolConfer(args: any): Promise<any> {
   const deadline = Date.now() + CFG.max_time_seconds * 1000;
   const answers = await Promise.all(picked.map((p) => askOne(p, messages, deadline)));
   const result = { tool: "confer", question, answers } as any;
+  if (unknown.length > 0) result.skipped_unknown_providers = unknown;
   result.transcript = writeTranscript("confer", result);
   return result;
 }
@@ -212,9 +265,9 @@ async function toolConfer(args: any): Promise<any> {
 async function toolDebate(args: any): Promise<any> {
   const topic: string = args.topic;
   const context: string = args.context ?? "";
-  const names: string[] = args.providers ?? activeProviders().map((p) => p.name);
-  const picked = names.map((n) => ALL_PROVIDERS[n]).filter(Boolean);
-  if (picked.length < 2) return { error: "debate needs at least 2 active providers" };
+  const { resolved: picked, unknown } = resolveProviders(args.providers);
+  if (unknown.length > 0 && picked.length < 2) return unknownProviderError(unknown);
+  if (picked.length < 2) return { error: "debate needs at least 2 providers with keys in .env", available_now: Object.keys(ALL_PROVIDERS).sort() };
 
   const maxRounds = Number(args.max_rounds ?? CFG.max_rounds);
   const deadline = Date.now() + CFG.max_time_seconds * 1000;
@@ -261,6 +314,7 @@ async function toolDebate(args: any): Promise<any> {
     transcript,
     synthesis,
   } as any;
+  if (unknown.length > 0) result.skipped_unknown_providers = unknown;
   result.transcript_path = writeTranscript("debate", result);
   return result;
 }
@@ -271,24 +325,34 @@ async function toolPlan(args: any): Promise<any> {
   return toolDebate({
     topic: `We need a step-by-step plan to achieve this goal.\n\nGOAL: ${goal}\n\nCONSTRAINTS: ${constraints || "(none stated)"}\n\nReturn: (1) the plan as numbered steps, (2) risks, (3) alternatives considered.`,
     context: args.context ?? "",
+    providers: args.providers,
+    moderator: args.moderator,
   });
 }
 
 async function toolReview(args: any): Promise<any> {
   return toolConfer({
     question: `Review the following code/proposal as peers. Call out bugs, smells, missed edge cases, and suggest concrete changes.\n\nINTENT: ${args.intent || "(not stated)"}\n\nSNIPPET:\n\`\`\`\n${args.snippet}\n\`\`\``,
+    providers: args.providers,
   });
 }
 
 // ------------------------------------------------------------
 // MCP JSON-RPC loop
 // ------------------------------------------------------------
+const PROVIDER_DESC = "Ad-hoc subset of provider names (e.g. ['openai','gemini','xai']). Omit to use the configured active set. Call list_providers first if you're unsure which names are available.";
+
 const TOOLS: Record<string, { description: string; inputSchema: any; handler: (a: any) => Promise<any> }> = {
+  list_providers: {
+    description: "List every provider the server knows about and whether each is currently usable (has an API key in .env). Call this first to discover who's on the panel.",
+    inputSchema: { type: "object", properties: {} },
+    handler: toolListProviders,
+  },
   confer: {
-    description: "Ask multiple LLMs the same question and return all answers in parallel.",
+    description: "Ask one or more LLMs the same question and return their answers in parallel.",
     inputSchema: { type: "object", properties: {
       question: { type: "string" }, context: { type: "string" },
-      providers: { type: "array", items: { type: "string" } },
+      providers: { type: "array", items: { type: "string" }, description: PROVIDER_DESC },
     }, required: ["question"] },
     handler: toolConfer,
   },
@@ -296,8 +360,9 @@ const TOOLS: Record<string, { description: string; inputSchema: any; handler: (a
     description: "Run a bounded multi-round debate across LLMs; moderator synthesises the result.",
     inputSchema: { type: "object", properties: {
       topic: { type: "string" }, context: { type: "string" },
-      providers: { type: "array", items: { type: "string" } },
-      max_rounds: { type: "integer" }, moderator: { type: "string" },
+      providers: { type: "array", items: { type: "string" }, description: PROVIDER_DESC + " Needs at least 2." },
+      max_rounds: { type: "integer" },
+      moderator: { type: "string", description: "Provider name to run the synthesis round. Defaults to config.moderator." },
     }, required: ["topic"] },
     handler: toolDebate,
   },
@@ -305,13 +370,16 @@ const TOOLS: Record<string, { description: string; inputSchema: any; handler: (a
     description: "Collaborative planning across LLMs with risks + alternatives.",
     inputSchema: { type: "object", properties: {
       goal: { type: "string" }, constraints: { type: "string" }, context: { type: "string" },
+      providers: { type: "array", items: { type: "string" }, description: PROVIDER_DESC + " Needs at least 2." },
+      moderator: { type: "string" },
     }, required: ["goal"] },
     handler: toolPlan,
   },
   review: {
-    description: "Peer-review a code snippet or proposal across LLMs.",
+    description: "Peer-review a code snippet or proposal across one or more LLMs.",
     inputSchema: { type: "object", properties: {
       snippet: { type: "string" }, intent: { type: "string" },
+      providers: { type: "array", items: { type: "string" }, description: PROVIDER_DESC },
     }, required: ["snippet"] },
     handler: toolReview,
   },

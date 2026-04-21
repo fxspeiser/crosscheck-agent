@@ -227,11 +227,80 @@ def _ask_one(p: Provider, messages: list[dict], deadline: float) -> dict:
         return {"provider": p.name, "model": p.model, "error": str(e)}
 
 
+def _resolve_providers(names: list[str] | None) -> tuple[list[Provider], list[str]]:
+    """Resolve requested provider names into Provider objects.
+
+    names=None  -> use the config's active set.
+    names=[...] -> use exactly that set (ad-hoc), preserving order, de-duped.
+
+    Returns (resolved, unknown). `unknown` contains names the caller asked for
+    that aren't registered (wrong spelling, or no API key in .env).
+    """
+    if not names:
+        return active_providers(), []
+    seen: set[str] = set()
+    resolved: list[Provider] = []
+    unknown: list[str] = []
+    for n in names:
+        key = n.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        prov = ALL_PROVIDERS.get(key)
+        if prov is None:
+            unknown.append(n)
+        else:
+            resolved.append(prov)
+    return resolved, unknown
+
+
+KNOWN_PROVIDERS = [
+    "anthropic", "openai", "xai", "gemini", "mistral", "groq", "deepseek",
+]
+
+
+def _unknown_provider_error(unknown: list[str]) -> dict:
+    # Distinguish "typo" from "no API key in .env" so Claude can self-correct.
+    not_registered = [n for n in unknown if n.strip().lower() in KNOWN_PROVIDERS]
+    typos          = [n for n in unknown if n.strip().lower() not in KNOWN_PROVIDERS]
+    return {
+        "error": "requested providers are not available",
+        "unknown": unknown,
+        "needs_api_key_in_env": not_registered,
+        "unrecognised_names":   typos,
+        "available_now":        sorted(ALL_PROVIDERS.keys()),
+    }
+
+
+def tool_list_providers(_args: dict) -> dict:
+    """Return every provider the server knows about and its status."""
+    active = set(CFG.get("providers", []))
+    providers = []
+    for name in KNOWN_PROVIDERS:
+        prov = ALL_PROVIDERS.get(name)
+        providers.append({
+            "name":      name,
+            "available": prov is not None,
+            "active":    name in active,
+            "model":     prov.model if prov else None,
+        })
+    return {
+        "providers": providers,
+        "moderator_default": CFG.get("moderator"),
+        "usage_hint": (
+            "Pass a 'providers' array to confer/debate/plan/review to pick an "
+            "ad-hoc subset, e.g. providers=['openai','gemini']. Omit the field "
+            "to use the configured active set."
+        ),
+    }
+
+
 def tool_confer(args: dict) -> dict:
     question: str = args["question"]
     context: str = args.get("context", "")
-    providers = args.get("providers") or [p.name for p in active_providers()]
-    selected = [ALL_PROVIDERS[n] for n in providers if n in ALL_PROVIDERS]
+    selected, unknown = _resolve_providers(args.get("providers"))
+    if unknown and not selected:
+        return _unknown_provider_error(unknown)
     if not selected:
         return {"error": "no active providers have API keys in .env"}
 
@@ -247,6 +316,8 @@ def tool_confer(args: dict) -> dict:
     deadline = _deadline()
     answers = [_ask_one(p, messages, deadline) for p in selected]
     result = {"tool": "confer", "question": question, "answers": answers}
+    if unknown:
+        result["skipped_unknown_providers"] = unknown
     result["transcript"] = write_transcript("confer", result)
     return result
 
@@ -254,10 +325,14 @@ def tool_confer(args: dict) -> dict:
 def tool_debate(args: dict) -> dict:
     topic: str = args["topic"]
     context: str = args.get("context", "")
-    providers = args.get("providers") or [p.name for p in active_providers()]
-    selected = [ALL_PROVIDERS[n] for n in providers if n in ALL_PROVIDERS]
+    selected, unknown = _resolve_providers(args.get("providers"))
+    if unknown and len(selected) < 2:
+        return _unknown_provider_error(unknown)
     if len(selected) < 2:
-        return {"error": "debate needs at least 2 active providers"}
+        return {
+            "error": "debate needs at least 2 providers with keys in .env",
+            "available_now": sorted(ALL_PROVIDERS.keys()),
+        }
 
     max_rounds = int(args.get("max_rounds", CFG.get("max_rounds", 3)))
     deadline = _deadline()
@@ -313,6 +388,8 @@ def tool_debate(args: dict) -> dict:
         "transcript": transcript,
         "synthesis": synthesis,
     }
+    if unknown:
+        result["skipped_unknown_providers"] = unknown
     result["transcript_path"] = write_transcript("debate", result)
     return result
 
@@ -326,7 +403,12 @@ def tool_plan(args: dict) -> dict:
         f"CONSTRAINTS: {constraints or '(none stated)'}\n\n"
         "Return: (1) the plan as numbered steps, (2) risks, (3) alternatives considered."
     )
-    return tool_debate({"topic": merged, "context": args.get("context", "")})
+    return tool_debate({
+        "topic": merged,
+        "context": args.get("context", ""),
+        "providers": args.get("providers"),
+        "moderator": args.get("moderator"),
+    })
 
 
 def tool_review(args: dict) -> dict:
@@ -338,21 +420,36 @@ def tool_review(args: dict) -> dict:
         f"INTENT: {intent or '(not stated)'}\n\n"
         f"SNIPPET:\n```\n{snippet}\n```"
     )
-    return tool_confer({"question": question})
+    return tool_confer({
+        "question": question,
+        "providers": args.get("providers"),
+    })
 
 
 # ------------------------------------------------------------
 # MCP server (JSON-RPC 2.0 over stdio)
 # ------------------------------------------------------------
+_PROVIDER_ARG_DESCRIPTION = (
+    "Ad-hoc subset of provider names (e.g. ['openai','gemini','xai']). "
+    "Omit to use the configured active set. Call list_providers first if "
+    "you're unsure which names are available."
+)
+
 TOOLS = {
+    "list_providers": {
+        "description": "List every provider the server knows about and whether each is currently usable (has an API key in .env). Call this first to discover who's on the panel.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_list_providers,
+    },
     "confer": {
-        "description": "Ask multiple LLMs the same question and return all answers in parallel.",
+        "description": "Ask one or more LLMs the same question and return their answers in parallel.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "question": {"type": "string", "description": "The question or prompt."},
-                "context":  {"type": "string", "description": "Optional shared context."},
-                "providers": {"type": "array", "items": {"type": "string"}, "description": "Subset of active providers; defaults to all active."},
+                "question":  {"type": "string", "description": "The question or prompt."},
+                "context":   {"type": "string", "description": "Optional shared context."},
+                "providers": {"type": "array", "items": {"type": "string"},
+                              "description": _PROVIDER_ARG_DESCRIPTION},
             },
             "required": ["question"],
         },
@@ -363,11 +460,13 @@ TOOLS = {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "topic":     {"type": "string"},
-                "context":   {"type": "string"},
-                "providers": {"type": "array", "items": {"type": "string"}},
-                "max_rounds":{"type": "integer"},
-                "moderator": {"type": "string"},
+                "topic":      {"type": "string"},
+                "context":    {"type": "string"},
+                "providers":  {"type": "array", "items": {"type": "string"},
+                               "description": _PROVIDER_ARG_DESCRIPTION + " Needs at least 2."},
+                "max_rounds": {"type": "integer"},
+                "moderator":  {"type": "string",
+                               "description": "Provider name to run the synthesis round. Defaults to config.moderator."},
             },
             "required": ["topic"],
         },
@@ -381,18 +480,23 @@ TOOLS = {
                 "goal":        {"type": "string"},
                 "constraints": {"type": "string"},
                 "context":     {"type": "string"},
+                "providers":   {"type": "array", "items": {"type": "string"},
+                                "description": _PROVIDER_ARG_DESCRIPTION + " Needs at least 2."},
+                "moderator":   {"type": "string"},
             },
             "required": ["goal"],
         },
         "handler": tool_plan,
     },
     "review": {
-        "description": "Peer-review a code snippet or proposal across LLMs.",
+        "description": "Peer-review a code snippet or proposal across one or more LLMs.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "snippet": {"type": "string"},
-                "intent":  {"type": "string"},
+                "snippet":   {"type": "string"},
+                "intent":    {"type": "string"},
+                "providers": {"type": "array", "items": {"type": "string"},
+                              "description": _PROVIDER_ARG_DESCRIPTION},
             },
             "required": ["snippet"],
         },

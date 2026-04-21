@@ -25,18 +25,86 @@ Claude │ Claude Code  │     MCP      ┌────────────
 
 ## Tools
 
-| Tool      | What it does                                                                 |
-|-----------|------------------------------------------------------------------------------|
-| `confer`  | Ask N providers the same question in parallel; return every answer.          |
-| `debate`  | Bounded round-trip debate; the configured moderator synthesises a result.    |
-| `plan`    | Collaborative step-by-step planning with risks + alternatives.               |
-| `review`  | Peer code / proposal review across multiple LLMs.                            |
+| Tool             | What it does                                                                 |
+|------------------|------------------------------------------------------------------------------|
+| `list_providers` | Discover which LLMs are currently available and which are in the active set.|
+| `confer`         | Ask one or more providers the same question in parallel; return every answer.|
+| `debate`         | Bounded round-trip debate; the configured moderator synthesises a result.   |
+| `plan`           | Collaborative step-by-step planning with risks + alternatives.              |
+| `review`         | Peer code / proposal review across one or more LLMs.                        |
+
+### Ad-hoc panels
+
+`confer`, `debate`, `plan`, and `review` all accept an optional `providers`
+array so you can assemble a panel on the fly instead of using the configured
+active set. Some useful patterns from inside Claude Code:
+
+```
+# "I want a fast second opinion from Grok only, skip everyone else."
+confer(question="…", providers=["xai"])
+
+# "Pit GPT against Gemini, let OpenAI moderate."
+debate(topic="…", providers=["openai", "gemini"], moderator="openai")
+
+# "Review this diff with just my local-fast models."
+review(snippet="…", providers=["groq", "deepseek"])
+
+# "Plan the migration; I want every model in the house."
+plan(goal="…", providers=["anthropic","openai","xai","gemini","mistral","groq","deepseek"])
+```
+
+Not sure what's wired up? Call `list_providers` first — it returns every
+known provider, whether it has an API key in `.env`, and whether it's in
+the configured active set. If you ask for a provider that has no key,
+`crosscheck` returns a structured error telling you exactly what's missing
+so Claude can self-correct.
 
 Every run obeys the limits in `crosscheck.config.json`:
 
 - `max_rounds` — hard cap on unsupervised round trips.
 - `token_cap` — total token budget spread across providers × rounds.
 - `max_time_seconds` — wall-clock deadline enforced per run.
+
+## Asking Claude to use it
+
+Once the MCP server is registered, you don't call the tools by hand — Claude
+does, based on what you say. A few prompts that work well inside Claude Code:
+
+**Quick sanity check across the panel**
+
+> "Confer with the panel: is a `uuid.v7()` primary key a bad idea for a
+> high-write Postgres table?"
+
+**Pick a specific model on the fly**
+
+> "Ask Grok only — what's the cheapest way to shard this Redis cluster?"
+
+> "Just confer with GPT and Gemini on whether this regex is ReDoS-safe."
+
+**Debate between specific peers**
+
+> "Debate this with OpenAI and Gemini, let Claude moderate: should we use
+> Server-Sent Events or WebSockets for the notification stream?"
+
+**Plan with a hand-picked team**
+
+> "Plan the auth migration with Anthropic, OpenAI, and xAI. Constraint: zero
+> downtime, Postgres-backed sessions, 3M active users."
+
+**Peer code review**
+
+> "Have Groq and DeepSeek review this migration for race conditions:
+> `<paste SQL>`"
+
+**Discover what's wired up**
+
+> "List the providers crosscheck has available and tell me which ones are
+> missing an API key."
+
+Claude will call `list_providers`, `confer`, `debate`, `plan`, or `review`
+under the hood, pass the subset you named, and stream the responses back.
+If you name a provider that isn't configured, crosscheck returns a
+structured error so Claude can ask you what to do instead of guessing.
 
 ## Quick start
 
