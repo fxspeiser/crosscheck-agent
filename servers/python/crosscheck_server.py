@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -30,7 +31,6 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT / "crosscheck.config.json"
 CONFIG_EXAMPLE = ROOT / "crosscheck.config.example.json"
 ENV_PATH = ROOT / ".env"
-TRANSCRIPT_DIR = ROOT / ".crosscheck" / "transcripts"
 
 
 # ------------------------------------------------------------
@@ -55,6 +55,13 @@ def load_config() -> dict[str, Any]:
 
 ENV = load_env()
 CFG = load_config()
+
+def _resolve_transcript_dir(cfg: dict[str, Any]) -> Path:
+    raw = cfg.get("transcript_dir") or ".crosscheck/transcripts"
+    p = Path(str(raw))
+    return p if p.is_absolute() else (ROOT / p)
+
+TRANSCRIPT_DIR = _resolve_transcript_dir(CFG)
 
 
 # ------------------------------------------------------------
@@ -191,20 +198,21 @@ def write_transcript(kind: str, payload: dict) -> str | None:
     if not CFG.get("log_transcripts", True):
         return None
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%dT%H%M%S")
+    stamp = str(int(time.time() * 1000))
     path = TRANSCRIPT_DIR / f"{stamp}-{kind}.json"
     path.write_text(json.dumps(payload, indent=2))
-    return str(path.relative_to(ROOT))
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 # ------------------------------------------------------------
 # Tool implementations
 # ------------------------------------------------------------
-def _per_call_tokens() -> int:
-    rounds = max(1, int(CFG.get("max_rounds", 3)))
-    providers = max(1, len(active_providers()))
-    # Spread the total token budget across rounds * providers.
-    return max(256, int(CFG.get("token_cap", 8000)) // (rounds * providers))
+def _per_call_tokens(total_calls: int) -> int:
+    calls = max(1, int(total_calls))
+    return max(256, int(CFG.get("token_cap", 8000)) // calls)
 
 
 def _deadline() -> float:
@@ -215,16 +223,22 @@ def _time_left(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
-def _ask_one(p: Provider, messages: list[dict], deadline: float) -> dict:
-    budget = _per_call_tokens()
+def _ask_one(p: Provider, messages: list[dict], deadline: float, max_tokens: int) -> dict:
     temp = float(CFG.get("temperature", 0.4))
     if _time_left(deadline) <= 0:
         return {"provider": p.name, "model": p.model, "error": "time budget exhausted"}
     try:
-        out = p.send(messages, budget, temp)
+        out = p.send(messages, max_tokens, temp)
         return {"provider": p.name, "model": p.model, "response": out}
     except Exception as e:
         return {"provider": p.name, "model": p.model, "error": str(e)}
+
+def _ask_many_parallel(providers: list[Provider], messages: list[dict], deadline: float, max_tokens: int) -> list[dict]:
+    if len(providers) <= 1:
+        return [_ask_one(providers[0], messages, deadline, max_tokens)] if providers else []
+    with ThreadPoolExecutor(max_workers=len(providers)) as ex:
+        futures = [ex.submit(_ask_one, p, messages, deadline, max_tokens) for p in providers]
+        return [f.result() for f in futures]
 
 
 def _resolve_providers(names: list[str] | None) -> tuple[list[Provider], list[str]]:
@@ -314,11 +328,15 @@ def tool_confer(args: dict) -> dict:
     messages.append({"role": "user", "content": question})
 
     deadline = _deadline()
-    answers = [_ask_one(p, messages, deadline) for p in selected]
+    per_call = _per_call_tokens(len(selected))
+    answers = _ask_many_parallel(selected, messages, deadline, per_call)
     result = {"tool": "confer", "question": question, "answers": answers}
     if unknown:
         result["skipped_unknown_providers"] = unknown
-    result["transcript"] = write_transcript("confer", result)
+    path = write_transcript("confer", result)
+    if path:
+        result["transcript_path"] = path
+        result["transcript"] = path  # backwards-compatible alias
     return result
 
 
@@ -338,6 +356,7 @@ def tool_debate(args: dict) -> dict:
     deadline = _deadline()
     transcript: list[dict] = []
     shared_context = context
+    per_call = _per_call_tokens(max(1, max_rounds) * len(selected) + 1)
 
     for rnd in range(1, max_rounds + 1):
         if _time_left(deadline) <= 1:
@@ -362,7 +381,7 @@ def tool_debate(args: dict) -> dict:
         for p in selected:
             if _time_left(deadline) <= 1:
                 break
-            entry = _ask_one(p, round_messages, deadline)
+            entry = _ask_one(p, round_messages, deadline, per_call)
             entry["round"] = rnd
             transcript.append(entry)
 
@@ -379,7 +398,7 @@ def tool_debate(args: dict) -> dict:
             {"role": "system", "content": "You are the moderator. Synthesise the debate into a single grounded recommendation."},
             {"role": "user", "content": f"TOPIC: {topic}\n\nTRANSCRIPT:\n{condensed}"},
         ]
-        synthesis = _ask_one(moderator, synth_messages, deadline)
+        synthesis = _ask_one(moderator, synth_messages, deadline, per_call)
 
     result = {
         "tool": "debate",

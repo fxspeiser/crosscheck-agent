@@ -13,7 +13,6 @@ const ROOT = resolve(HERE, "..", "..", "..");
 const CONFIG_PATH = resolve(ROOT, "crosscheck.config.json");
 const CONFIG_EXAMPLE = resolve(ROOT, "crosscheck.config.example.json");
 const ENV_PATH = resolve(ROOT, ".env");
-const TRANSCRIPT_DIR = resolve(ROOT, ".crosscheck", "transcripts");
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
 type Config = {
@@ -24,6 +23,7 @@ type Config = {
   moderator: string;
   temperature: number;
   log_transcripts: boolean;
+  transcript_dir?: string;
 };
 type Provider = {
   name: string;
@@ -52,6 +52,7 @@ function loadConfig(): Config {
 
 const ENV = loadEnv();
 const CFG = loadConfig();
+const TRANSCRIPT_DIR = resolve(ROOT, CFG.transcript_dir ?? ".crosscheck/transcripts");
 
 // ------------------------------------------------------------
 // Provider adapters
@@ -163,23 +164,22 @@ function activeProviders(): Provider[] {
 function writeTranscript(kind: string, payload: unknown): string | null {
   if (!CFG.log_transcripts) return null;
   mkdirSync(TRANSCRIPT_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "");
+  const stamp = String(Date.now());
   const path = resolve(TRANSCRIPT_DIR, `${stamp}-${kind}.json`);
   writeFileSync(path, JSON.stringify(payload, null, 2));
   return relative(ROOT, path);
 }
 
-function perCallTokens(): number {
-  const rounds = Math.max(1, CFG.max_rounds);
-  const count = Math.max(1, activeProviders().length);
-  return Math.max(256, Math.floor(CFG.token_cap / (rounds * count)));
+function perCallTokens(totalCalls: number): number {
+  const calls = Math.max(1, Math.floor(totalCalls));
+  return Math.max(256, Math.floor(CFG.token_cap / calls));
 }
 
-async function askOne(p: Provider, messages: Msg[], deadline: number): Promise<Record<string, unknown>> {
+async function askOne(p: Provider, messages: Msg[], deadline: number, maxTokens: number): Promise<Record<string, unknown>> {
   const timeLeft = deadline - Date.now();
   if (timeLeft <= 0) return { provider: p.name, model: p.model, error: "time budget exhausted" };
   try {
-    const response = await p.send(messages, perCallTokens(), CFG.temperature);
+    const response = await p.send(messages, maxTokens, CFG.temperature);
     return { provider: p.name, model: p.model, response };
   } catch (e) {
     return { provider: p.name, model: p.model, error: (e as Error).message };
@@ -255,10 +255,15 @@ async function toolConfer(args: any): Promise<any> {
   messages.push({ role: "user", content: question });
 
   const deadline = Date.now() + CFG.max_time_seconds * 1000;
-  const answers = await Promise.all(picked.map((p) => askOne(p, messages, deadline)));
+  const maxTokens = perCallTokens(picked.length);
+  const answers = await Promise.all(picked.map((p) => askOne(p, messages, deadline, maxTokens)));
   const result = { tool: "confer", question, answers } as any;
   if (unknown.length > 0) result.skipped_unknown_providers = unknown;
-  result.transcript = writeTranscript("confer", result);
+  const path = writeTranscript("confer", result);
+  if (path) {
+    result.transcript_path = path;
+    result.transcript = path; // backwards-compatible alias
+  }
   return result;
 }
 
@@ -272,6 +277,7 @@ async function toolDebate(args: any): Promise<any> {
   const maxRounds = Number(args.max_rounds ?? CFG.max_rounds);
   const deadline = Date.now() + CFG.max_time_seconds * 1000;
   const transcript: any[] = [];
+  const maxTokens = perCallTokens(Math.max(1, maxRounds) * picked.length + 1);
 
   for (let rnd = 1; rnd <= maxRounds; rnd++) {
     if (deadline - Date.now() <= 1000) break;
@@ -286,7 +292,7 @@ async function toolDebate(args: any): Promise<any> {
     }
     for (const p of picked) {
       if (deadline - Date.now() <= 1000) break;
-      const entry = await askOne(p, roundMessages, deadline);
+      const entry = await askOne(p, roundMessages, deadline, maxTokens);
       (entry as any).round = rnd;
       transcript.push(entry);
     }
@@ -304,6 +310,7 @@ async function toolDebate(args: any): Promise<any> {
         { role: "user", content: `TOPIC: ${topic}\n\nTRANSCRIPT:\n${condensed}` },
       ],
       deadline,
+      maxTokens,
     );
   }
 

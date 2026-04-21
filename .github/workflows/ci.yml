@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Python smoke
+        run: |
+          python3 -m py_compile servers/python/crosscheck_server.py
+          python3 scripts/smoke_jsonrpc.py python3 servers/python/crosscheck_server.py
+
+      - name: Perl smoke
+        run: |
+          perl -c servers/perl/crosscheck_server.pl
+          python3 scripts/smoke_jsonrpc.py perl servers/perl/crosscheck_server.pl
+
+      - name: TypeScript build + smoke
+        run: |
+          cd servers/typescript
+          npm ci
+          npm run build
+          cd ../..
+          python3 scripts/smoke_jsonrpc.py node servers/typescript/dist/index.js
+
+      - name: Rust build + smoke
+        run: |
+          cd servers/rust
+          cargo build --release
+          cd ../..
+          python3 scripts/smoke_jsonrpc.py ./servers/rust/target/release/crosscheck-agent-rs
+

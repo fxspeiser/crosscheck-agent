@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "crosscheck-agent config",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "max_rounds": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 3,
+      "description": "Hard cap on unsupervised round trips."
+    },
+    "token_cap": {
+      "type": "integer",
+      "minimum": 256,
+      "default": 8000,
+      "description": "Total completion-token budget spread across provider calls."
+    },
+    "max_time_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 120,
+      "description": "Wall-clock deadline enforced per run."
+    },
+    "providers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["anthropic", "openai", "xai"],
+      "description": "Default active provider set; providers without API keys are skipped at runtime."
+    },
+    "moderator": {
+      "type": "string",
+      "default": "anthropic",
+      "description": "Provider name used for synthesis in debate/plan."
+    },
+    "temperature": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2,
+      "default": 0.4
+    },
+    "log_transcripts": {
+      "type": "boolean",
+      "default": true
+    },
+    "transcript_dir": {
+      "type": "string",
+      "default": ".crosscheck/transcripts",
+      "description": "Directory to write JSON transcripts into (relative to repo root unless absolute)."
+    }
+  },
+  "required": ["max_rounds", "token_cap", "max_time_seconds", "providers", "moderator"]
+}

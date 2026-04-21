@@ -34,6 +34,8 @@ struct Config {
     temperature: f32,
     #[serde(default = "default_true")]
     log_transcripts: bool,
+    #[serde(default)]
+    transcript_dir: Option<String>,
 }
 fn default_temp() -> f32 { 0.4 }
 fn default_true() -> bool { true }
@@ -221,13 +223,13 @@ struct Ctx {
     cfg: Config,
     providers: HashMap<String, Provider>,
     root: PathBuf,
+    transcript_dir: PathBuf,
     client: Client,
 }
 
-fn per_call_tokens(cfg: &Config, active_count: usize) -> u32 {
-    let rounds = cfg.max_rounds.max(1);
-    let count = active_count.max(1) as u32;
-    (cfg.token_cap / (rounds * count)).max(256)
+fn per_call_tokens(cfg: &Config, total_calls: usize) -> u32 {
+    let calls = total_calls.max(1) as u32;
+    (cfg.token_cap / calls).max(256)
 }
 
 fn active_providers(ctx: &Ctx) -> Vec<Provider> {
@@ -297,17 +299,22 @@ async fn tool_list_providers(ctx: Arc<Ctx>, _args: Value) -> Value {
 
 fn write_transcript(ctx: &Ctx, kind: &str, payload: &Value) -> Option<String> {
     if !ctx.cfg.log_transcripts { return None; }
-    let dir = ctx.root.join(".crosscheck").join("transcripts");
-    let _ = fs::create_dir_all(&dir);
-    let stamp = chrono_stamp();
-    let path = dir.join(format!("{}-{}.json", stamp, kind));
+    let _ = fs::create_dir_all(&ctx.transcript_dir);
+    let stamp = epoch_millis();
+    let path = ctx.transcript_dir.join(format!("{}-{}.json", stamp, kind));
     fs::write(&path, serde_json::to_string_pretty(payload).unwrap()).ok()?;
-    path.strip_prefix(&ctx.root).ok().map(|p| p.to_string_lossy().to_string())
+    path.strip_prefix(&ctx.root)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| Some(path.to_string_lossy().to_string()))
 }
 
-fn chrono_stamp() -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    format!("{}", now)
+fn epoch_millis() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    format!("{}", ms)
 }
 
 async fn ask_one(ctx: &Ctx, p: &Provider, messages: &[Message], deadline: Instant, per_call: u32) -> Value {
@@ -350,7 +357,8 @@ async fn tool_confer(ctx: Arc<Ctx>, args: Value) -> Value {
     let mut out = json!({"tool": "confer", "question": question, "answers": answers});
     if !unknown.is_empty() { out["skipped_unknown_providers"] = json!(unknown); }
     if let Some(path) = write_transcript(&ctx, "confer", &out) {
-        out["transcript"] = json!(path);
+        out["transcript_path"] = json!(path);
+        out["transcript"] = json!(path); // backwards-compatible alias
     }
     out
 }
@@ -369,7 +377,8 @@ async fn tool_debate(ctx: Arc<Ctx>, args: Value) -> Value {
     }
     let max_rounds = args["max_rounds"].as_u64().unwrap_or(ctx.cfg.max_rounds as u64) as u32;
     let deadline = Instant::now() + Duration::from_secs(ctx.cfg.max_time_seconds);
-    let per_call = per_call_tokens(&ctx.cfg, picked.len());
+    let total_calls = (max_rounds as usize).saturating_mul(picked.len()).saturating_add(1);
+    let per_call = per_call_tokens(&ctx.cfg, total_calls);
     let mut transcript: Vec<Value> = Vec::new();
 
     for rnd in 1..=max_rounds {
@@ -567,7 +576,8 @@ async fn main() {
     let cfg = load_config(&root);
     let providers = build_providers(&env_map);
     let client = Client::builder().build().expect("reqwest client");
-    let ctx = Arc::new(Ctx { cfg, providers, root, client });
+    let transcript_dir = root.join(cfg.transcript_dir.clone().unwrap_or_else(|| ".crosscheck/transcripts".into()));
+    let ctx = Arc::new(Ctx { cfg, providers, root, transcript_dir, client });
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin).lines();

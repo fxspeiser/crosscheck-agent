@@ -15,7 +15,6 @@ my $ROOT = File::Spec->rel2abs(File::Spec->catdir($Bin, '..', '..'));
 my $CONFIG      = File::Spec->catfile($ROOT, 'crosscheck.config.json');
 my $CONFIG_EX   = File::Spec->catfile($ROOT, 'crosscheck.config.example.json');
 my $ENV_FILE    = File::Spec->catfile($ROOT, '.env');
-my $TRANS_DIR   = File::Spec->catdir($ROOT, '.crosscheck', 'transcripts');
 
 my %ENV_MAP;
 
@@ -207,23 +206,23 @@ sub tool_list_providers {
 }
 
 sub per_call_tokens {
-    my ($count) = @_;
-    my $rounds = ($CFG->{max_rounds} || 3) < 1 ? 1 : $CFG->{max_rounds};
-    $count = 1 if $count < 1;
-    my $budget = int(($CFG->{token_cap} || 8000) / ($rounds * $count));
+    my ($calls) = @_;
+    $calls = 1 if !$calls || $calls < 1;
+    my $budget = int(($CFG->{token_cap} || 8000) / $calls);
     return $budget < 256 ? 256 : $budget;
 }
 
 sub write_transcript {
     my ($kind, $payload) = @_;
     return undef unless $CFG->{log_transcripts} // 1;
-    unless (-d $TRANS_DIR) {
+    my $raw = $CFG->{transcript_dir} || '.crosscheck/transcripts';
+    my $dir = File::Spec->file_name_is_absolute($raw) ? $raw : File::Spec->catdir($ROOT, $raw);
+    unless (-d $dir) {
         require File::Path;
-        File::Path::make_path($TRANS_DIR);
+        File::Path::make_path($dir);
     }
-    my @t = gmtime(time);
-    my $stamp = sprintf("%04d%02d%02dT%02d%02d%02d", $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
-    my $path = File::Spec->catfile($TRANS_DIR, "$stamp-$kind.json");
+    my $stamp = int(time() * 1000);
+    my $path = File::Spec->catfile($dir, "$stamp-$kind.json");
     open my $fh, '>', $path or return undef;
     print $fh JSON::PP->new->pretty->encode($payload);
     close $fh;
@@ -265,12 +264,50 @@ sub tool_confer {
 
     my $deadline = time + ($CFG->{max_time_seconds} // 120);
     my $per_call = per_call_tokens(scalar @picked);
-    my @answers = map { ask_one($_, \@messages, $deadline, $per_call) } @picked;
+    my @answers;
+    if (scalar(@picked) <= 1 || ($^O // '') eq 'MSWin32') {
+        @answers = map { ask_one($_, \@messages, $deadline, $per_call) } @picked;
+    } else {
+        my @children;
+        for my $p (@picked) {
+            pipe(my $r, my $w) or do {
+                @answers = map { ask_one($_, \@messages, $deadline, $per_call) } @picked;
+                last;
+            };
+            my $pid = fork();
+            if (!defined $pid) {
+                close $r; close $w;
+                @answers = map { ask_one($_, \@messages, $deadline, $per_call) } @picked;
+                last;
+            }
+            if ($pid == 0) {
+                close $r;
+                my $entry = ask_one($p, \@messages, $deadline, $per_call);
+                print $w encode_json($entry);
+                close $w;
+                exit 0;
+            }
+            close $w;
+            push @children, { pid => $pid, fh => $r };
+        }
+        if (!@answers) {
+            for my $c (@children) {
+                local $/;
+                my $txt = readline($c->{fh});
+                close $c->{fh};
+                waitpid($c->{pid}, 0);
+                push @answers, (eval { decode_json($txt || '{}') } || { provider => '?', error => 'child decode failed' });
+            }
+        }
+    }
 
     my $result = { tool => 'confer', question => $question, answers => \@answers };
     $result->{skipped_unknown_providers} = $unknown_ref if @$unknown_ref;
     my $path = write_transcript('confer', $result);
-    $result->{transcript} = $path if defined $path;
+    if (defined $path) {
+        $result->{transcript_path} = $path;
+        $result->{transcript} = $path; # backwards-compatible alias
+    }
     return $result;
 }
 
@@ -290,7 +327,7 @@ sub tool_debate {
 
     my $max_rounds = $args->{max_rounds} // $CFG->{max_rounds} // 3;
     my $deadline = time + ($CFG->{max_time_seconds} // 120);
-    my $per_call = per_call_tokens(scalar @picked);
+    my $per_call = per_call_tokens(($max_rounds < 1 ? 1 : $max_rounds) * (scalar @picked) + 1);
     my @transcript;
 
     for my $rnd (1 .. $max_rounds) {
