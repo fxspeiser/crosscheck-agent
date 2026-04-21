@@ -1,0 +1,11 @@
+{
+  "$schema": "./schema/config.schema.json",
+  "max_rounds": 3,
+  "token_cap": 8000,
+  "max_time_seconds": 120,
+  "providers": ["anthropic", "openai", "xai"],
+  "moderator": "anthropic",
+  "temperature": 0.4,
+  "log_transcripts": true,
+  "transcript_dir": ".crosscheck/transcripts"
+}

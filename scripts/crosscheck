@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""crosscheck — terminal CLI to inspect and update crosscheck.config.json.
+
+Examples:
+  crosscheck config show
+  crosscheck config set max_rounds 5
+  crosscheck config set token_cap 12000
+  crosscheck config set max_time_seconds 300
+  crosscheck config set providers anthropic,openai,xai,gemini
+  crosscheck config set moderator openai
+  crosscheck providers list
+  crosscheck providers enable gemini
+  crosscheck providers disable xai
+  crosscheck doctor
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = ROOT / "crosscheck.config.json"
+EXAMPLE = ROOT / "crosscheck.config.example.json"
+ENV = ROOT / ".env"
+
+INT_FIELDS = {"max_rounds", "token_cap", "max_time_seconds"}
+FLOAT_FIELDS = {"temperature"}
+LIST_FIELDS = {"providers"}
+BOOL_FIELDS = {"log_transcripts"}
+
+KNOWN_PROVIDERS = [
+    "anthropic", "openai", "xai", "gemini", "mistral", "groq", "deepseek",
+]
+
+
+def load_config() -> dict:
+    src = CONFIG if CONFIG.exists() else EXAMPLE
+    with src.open() as f:
+        return json.load(f)
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def parse_value(field: str, raw: str):
+    if field in INT_FIELDS:
+        return int(raw)
+    if field in FLOAT_FIELDS:
+        return float(raw)
+    if field in LIST_FIELDS:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    if field in BOOL_FIELDS:
+        return raw.lower() in ("1", "true", "yes", "on")
+    return raw
+
+
+def cmd_config(args: list[str]) -> int:
+    if not args or args[0] == "show":
+        print(json.dumps(load_config(), indent=2))
+        return 0
+    if args[0] == "get":
+        cfg = load_config()
+        print(cfg.get(args[1], ""))
+        return 0
+    if args[0] == "set":
+        if len(args) < 3:
+            print("usage: crosscheck config set <field> <value>", file=sys.stderr)
+            return 2
+        field, raw = args[1], " ".join(args[2:])
+        cfg = load_config()
+        cfg[field] = parse_value(field, raw)
+        save_config(cfg)
+        print(f"{field} = {json.dumps(cfg[field])}")
+        return 0
+    print(f"unknown config subcommand: {args[0]}", file=sys.stderr)
+    return 2
+
+
+def cmd_providers(args: list[str]) -> int:
+    cfg = load_config()
+    active = set(cfg.get("providers", []))
+    if not args or args[0] == "list":
+        env_keys = read_env_keys()
+        for p in KNOWN_PROVIDERS:
+            on = "on " if p in active else "off"
+            key = f"{p.upper()}_API_KEY"
+            has = "key" if env_keys.get(key) else "   "
+            print(f"  [{on}] {p:<10} {has}")
+        return 0
+    if args[0] in ("enable", "disable"):
+        if len(args) < 2:
+            print(f"usage: crosscheck providers {args[0]} <provider>", file=sys.stderr)
+            return 2
+        provider = args[1]
+        if args[0] == "enable":
+            if provider not in active:
+                cfg.setdefault("providers", []).append(provider)
+        else:
+            cfg["providers"] = [p for p in cfg.get("providers", []) if p != provider]
+        save_config(cfg)
+        print(f"providers = {cfg['providers']}")
+        return 0
+    print(f"unknown providers subcommand: {args[0]}", file=sys.stderr)
+    return 2
+
+
+def read_env_keys() -> dict:
+    if not ENV.exists():
+        return {}
+    out: dict = {}
+    for line in ENV.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_doctor(_args: list[str]) -> int:
+    print(f"config : {CONFIG if CONFIG.exists() else EXAMPLE} {'(default)' if not CONFIG.exists() else ''}")
+    print(f"env    : {ENV if ENV.exists() else '(missing — run scripts/setup.sh)'}")
+    cfg = load_config()
+    env = read_env_keys()
+    missing = []
+    for p in cfg.get("providers", []):
+        if not env.get(f"{p.upper()}_API_KEY"):
+            missing.append(p)
+    if missing:
+        print(f"warn   : active providers with no API key in .env: {', '.join(missing)}")
+    else:
+        print("ok     : every active provider has a key in .env")
+    print(f"limits : rounds={cfg.get('max_rounds')} tokens={cfg.get('token_cap')} seconds={cfg.get('max_time_seconds')}")
+    return 0
+
+
+HELP = __doc__
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(HELP)
+        return 0
+    cmd, rest = argv[1], argv[2:]
+    if cmd == "config":
+        return cmd_config(rest)
+    if cmd == "providers":
+        return cmd_providers(rest)
+    if cmd == "doctor":
+        return cmd_doctor(rest)
+    print(f"unknown command: {cmd}\n", file=sys.stderr)
+    print(HELP, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

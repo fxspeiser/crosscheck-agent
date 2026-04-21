@@ -1,0 +1,21 @@
+{
+  "name": "crosscheck-agent-ts",
+  "version": "0.1.0",
+  "description": "TypeScript MCP server for crosscheck-agent.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "crosscheck-agent-ts": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

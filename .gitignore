@@ -1,0 +1,49 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# User-specific config (may contain keys)
+crosscheck.config.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node / TypeScript
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+
+# Rust
+target/
+Cargo.lock
+
+# Perl
+blib/
+_build/
+Build
+MYMETA.*
+*.bs
+*.o
+
+# Logs
+*.log
+logs/

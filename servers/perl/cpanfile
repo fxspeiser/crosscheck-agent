@@ -1,0 +1,3 @@
+requires 'IO::Socket::SSL';
+requires 'Net::SSLeay';
+# HTTP::Tiny and JSON::PP ship with core Perl >= 5.14.
