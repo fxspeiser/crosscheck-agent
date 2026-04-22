@@ -88,22 +88,33 @@ def _http_post(url: str, headers: dict, body: dict, timeout: float) -> dict:
         raise RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'ignore')}") from e
 
 
+def _is_openai_reasoning_model(model: str) -> bool:
+    # GPT-5 and the o-series are reasoning models: they require
+    # max_completion_tokens (not max_tokens) and reject custom temperature.
+    m = model.lower()
+    return m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+
+
 def openai_compatible(name: str, url: str, key_env: str, model_env: str, default_model: str) -> Provider | None:
     key = ENV.get(key_env)
     if not key:
         return None
     model = ENV.get(model_env, default_model)
+    # Only openai.com hosts reasoning models; Grok/Mistral/Groq/DeepSeek use legacy params.
+    is_openai = "api.openai.com" in url
 
     def send(messages: list[dict], max_tokens: int, temperature: float) -> str:
+        body: dict = {"model": model, "messages": messages}
+        if is_openai and _is_openai_reasoning_model(model):
+            body["max_completion_tokens"] = max_tokens
+            # Reasoning models only accept temperature=1 (default); omit entirely.
+        else:
+            body["max_tokens"] = max_tokens
+            body["temperature"] = temperature
         resp = _http_post(
             url,
             {"Authorization": f"Bearer {key}"},
-            {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
+            body,
             timeout=CFG.get("max_time_seconds", 120),
         )
         return resp["choices"][0]["message"]["content"]

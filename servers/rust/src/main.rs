@@ -145,12 +145,26 @@ fn build_providers(env: &HashMap<String, String>) -> HashMap<String, Provider> {
 async fn send(client: &Client, p: &Provider, messages: &[Message], max_tokens: u32, temperature: f32, timeout: Duration) -> Result<String, String> {
     match &p.kind {
         ProviderKind::OpenAICompatible { url, bearer } => {
-            let body = json!({
-                "model": p.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            });
+            // Reasoning models on openai.com require max_completion_tokens and reject custom temperature.
+            let is_openai = url.contains("api.openai.com");
+            let m = p.model.to_lowercase();
+            let is_reasoning = is_openai && (
+                m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+            );
+            let body = if is_reasoning {
+                json!({
+                    "model": p.model,
+                    "messages": messages,
+                    "max_completion_tokens": max_tokens,
+                })
+            } else {
+                json!({
+                    "model": p.model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                })
+            };
             let resp = client.post(url).timeout(timeout)
                 .bearer_auth(bearer)
                 .json(&body)

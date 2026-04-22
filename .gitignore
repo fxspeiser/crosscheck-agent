@@ -9,6 +9,9 @@ DESCRIPTION.md
 # User-specific config (may contain keys)
 crosscheck.config.json
 
+# Conferral transcripts — may contain sensitive prompts/responses
+.crosscheck/
+
 # OS
 .DS_Store
 Thumbs.db

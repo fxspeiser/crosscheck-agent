@@ -67,18 +67,39 @@ sub http_post {
 # ------------------------------------------------------------
 # Providers
 # ------------------------------------------------------------
+sub _is_openai_reasoning_model {
+    my ($model) = @_;
+    my $m = lc($model);
+    return $m =~ /^(gpt-5|o1|o3|o4)/ ? 1 : 0;
+}
+
 sub openai_compatible {
     my ($name, $url, $key_env, $model_env, $default_model) = @_;
     my $key = $ENV_MAP{$key_env} or return undef;
     my $model = $ENV_MAP{$model_env} || $default_model;
+    my $is_openai = index($url, 'api.openai.com') >= 0;
     return {
         name  => $name,
         model => $model,
         send  => sub {
             my ($messages, $max_tokens, $temperature) = @_;
-            my $resp = http_post($url,
-                { Authorization => "Bearer $key" },
-                { model => $model, messages => $messages, max_tokens => $max_tokens + 0, temperature => $temperature + 0.0 });
+            my $body;
+            if ($is_openai && _is_openai_reasoning_model($model)) {
+                # Reasoning models require max_completion_tokens and reject custom temperature.
+                $body = {
+                    model                 => $model,
+                    messages              => $messages,
+                    max_completion_tokens => $max_tokens + 0,
+                };
+            } else {
+                $body = {
+                    model       => $model,
+                    messages    => $messages,
+                    max_tokens  => $max_tokens + 0,
+                    temperature => $temperature + 0.0,
+                };
+            }
+            my $resp = http_post($url, { Authorization => "Bearer $key" }, $body);
             return ($resp->{choices}[0]{message}{content} // "");
         },
     };

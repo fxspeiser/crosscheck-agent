@@ -198,6 +198,27 @@ Any provider without a key in `.env` is silently skipped.
 When `log_transcripts` is on, every conferral / debate is persisted as JSON
 under `.crosscheck/transcripts/` (also gitignored).
 
+### Picking a sensible `token_cap`
+
+`token_cap` is the total completion-token budget for a single tool call,
+split across providers × rounds. The default (60000, for coding work) gives
+each call ~6.6k tokens with the default 3 rounds × 3 providers.
+
+One gotcha worth knowing: OpenAI's GPT-5 and o-series are **reasoning
+models**. crosscheck-agent reserves `max_completion_tokens` per call, and
+OpenAI counts that reservation against your tier's per-request / per-minute
+limit *before* the call runs. On lower usage tiers, a 6.6k reservation can
+trip a 429. If you see `HTTP 429: exceeded your current quota` on OpenAI
+only (Anthropic + xAI still work), drop the cap:
+
+```bash
+scripts/crosscheck config set token_cap 20000   # ~2.2k per call
+```
+
+Or raise your OpenAI usage tier. crosscheck-agent automatically uses
+`max_completion_tokens` and omits `temperature` when the model name starts
+with `gpt-5`, `o1`, `o3`, or `o4`.
+
 ## Layout
 
 ```

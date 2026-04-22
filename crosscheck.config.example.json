@@ -1,8 +1,8 @@
 {
   "$schema": "./schema/config.schema.json",
   "max_rounds": 3,
-  "token_cap": 8000,
-  "max_time_seconds": 120,
+  "token_cap": 60000,
+  "max_time_seconds": 180,
   "providers": ["anthropic", "openai", "xai"],
   "moderator": "anthropic",
   "temperature": 0.4,

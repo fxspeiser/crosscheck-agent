@@ -74,17 +74,31 @@ async function httpPost(url: string, headers: Record<string, string>, body: unkn
   }
 }
 
+function isOpenAIReasoningModel(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.startsWith("gpt-5") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4");
+}
+
 function openAICompatible(name: string, url: string, keyEnv: string, modelEnv: string, defaultModel: string): Provider | null {
   const key = ENV[keyEnv];
   if (!key) return null;
   const model = ENV[modelEnv] || defaultModel;
+  const isOpenAI = url.includes("api.openai.com");
   return {
     name, model,
     async send(messages, maxTokens, temperature) {
+      const body: Record<string, unknown> = { model, messages };
+      if (isOpenAI && isOpenAIReasoningModel(model)) {
+        body.max_completion_tokens = maxTokens;
+        // Reasoning models only accept temperature=1 (default); omit.
+      } else {
+        body.max_tokens = maxTokens;
+        body.temperature = temperature;
+      }
       const resp = await httpPost(
         url,
         { Authorization: `Bearer ${key}` },
-        { model, messages, max_tokens: maxTokens, temperature },
+        body,
         CFG.max_time_seconds * 1000,
       );
       return resp.choices?.[0]?.message?.content ?? "";
