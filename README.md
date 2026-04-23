@@ -9,6 +9,8 @@ Pick any runtime that matches your stack: **Python**, **TypeScript**,
 **Rust**, or **Perl**. All four implementations expose the same tool
 surface and read the same config file, so swapping runtimes is zero-friction.
 
+Why did I include different languages? So they can't tell you where you work that it isn't supported because it doesn't fit in your stack. Does it matter? Not really. Is that a corny requirement? Probably. But I did it so you didn't have to justify it. 
+
 ```
        ┌──────────────┐
 Claude │ Claude Code  │     MCP      ┌────────────────────────┐
